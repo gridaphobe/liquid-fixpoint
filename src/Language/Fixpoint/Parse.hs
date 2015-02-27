@@ -87,8 +87,7 @@ languageDef =
   emptyDef { Token.commentStart    = "/* "
            , Token.commentEnd      = " */"
            , Token.commentLine     = "--"
-           , Token.identStart      = satisfy (\_ -> False) 
-           , Token.identLetter     = satisfy (\_ -> False)
+           , Token.identLetter     = Token.identLetter emptyDef <|> oneOf "#.'"
            , Token.reservedNames   = [ "SAT"
                                      , "UNSAT"
                                      , "true"
@@ -103,27 +102,36 @@ languageDef =
                                      , "module"
                                      , "spec"
                                      , "where"
-                                     , "True"
-                                     , "Int"
                                      , "import"
-                                     , "_|_"
-                                     , "|"
                                      , "if", "then", "else"
+                                     , "mod", "and", "or"
+                                     , "class", "instance"
+                                     , "inline", "assert"
+                                     , "Local", "using", "type"
+                                     , "predicate", "expression"
+                                     , "embed", "qualif"
+                                     , "Decrease", "LAZYVAR"
+                                     , "Strict", "Lazy"
+                                     , "LIQUID", "variance", "invariant"
+                                     , "covariant", "contravariant", "bivariant"
                                      ]
            , Token.reservedOpNames = [ "+", "-", "*", "/", "\\"
                                      , "<", ">", "<=", ">=", "=", "!=" , "/="
-                                     , "mod", "and", "or" 
                                   --, "is"
                                      , "&&", "||"
                                      , "~", "=>", "<=>"
                                      , "->"
                                      , ":="
                                      , "&", "^", "<<", ">>", "--"
-                                     , "?", "Bexp" -- , "'"
+                                     , "?"
+                                     , "_|_"
+                                     , "|"
+                                     , ":", "::"
                                      ]
            }
 
 lexer         = Token.makeTokenParser languageDef
+identifier    = Token.identifier    lexer
 reserved      = Token.reserved      lexer
 reservedOp    = Token.reservedOp    lexer
 parens        = Token.parens        lexer
@@ -170,19 +178,19 @@ condIdP chars f
        if f (c:cs) then return (symbol $ T.pack $ c:cs) else parserZero
 
 upperIdP :: Parser Symbol
-upperIdP = condIdP symChars (not . isLower . head)
+upperIdP = condIdP symChars (not . isLower . head) <?> "uppercase identifier"
 
 lowerIdP :: Parser Symbol
-lowerIdP = condIdP symChars (isLower . head)
+lowerIdP = condIdP symChars (isLower . head) <?> "lowercase identifier"
 
 locLowerIdP = locParserP lowerIdP 
 locUpperIdP = locParserP upperIdP
 
 symbolP :: Parser Symbol
-symbolP = symbol <$> symCharsP
+symbolP = symbol <$> identifier
 
 constantP :: Parser Constant
-constantP = try (liftM R double) <|> liftM I integer
+constantP = try (liftM R double) <|> liftM I integer <?> "number"
 
 symconstP :: Parser SymConst
 symconstP = SL . T.pack <$> stringLiteral
@@ -192,15 +200,14 @@ expr0P
   =  (fastIfP EIte exprP)
  <|> (ESym <$> symconstP)
  <|> (ECon <$> constantP)
- <|> (reserved "_|_" >> return EBot)
+ <|> (reservedOp "_|_" >> return EBot)
  <|> try (parens  exprP)
  <|> try (parens  exprCastP)
- <|> (charsExpr <$> symCharsP)
+ <|> (charsExpr <$> identifier)
 
 charsExpr cs
-  | isLower (T.head t) = expr cs
-  | otherwise          = EVar cs
-  where t = symbolText cs
+  | isLower (head cs)  = expr $ symbol cs
+  | otherwise          = EVar $ symbol cs
 --  <|> try (parens $ condP EIte exprP)
 
 fastIfP f bodyP 
@@ -220,8 +227,10 @@ expr1P
 
 exprP :: Parser Expr 
 exprP = buildExpressionParser bops expr1P
+     <?> "expression"
 
 funAppP            =  (try litP) <|> (try exprFunSpacesP) <|> (try exprFunSemisP) <|> exprFunCommasP
+                  <?> "function application"
   where 
     exprFunSpacesP = liftM2 EApp funSymbolP (sepBy1 expr0P spaces) 
     exprFunCommasP = liftM2 EApp funSymbolP (parens        $ sepBy exprP comma)
@@ -234,6 +243,7 @@ litP = do reserved "lit"
           l <- stringLiteral
           s <- try (bvSortP "Size32" S32) <|> bvSortP "Size64" S64
           return $ ECon $ L (T.pack l) (mkSort s)
+    <?> "bit-vector literal"
   where 
     bvSortP ss s = do parens (reserved "BitVec" >> parens (reserved ss >> reserved "obj"))
                       return s
@@ -272,7 +282,7 @@ bops = [ [ Prefix (reservedOp "-"   >> return ENeg)]
        , [ Infix  (reservedOp "-"   >> return (EBin Minus)) AssocLeft
          , Infix  (reservedOp "+"   >> return (EBin Plus )) AssocLeft
          ]
-       , [ Infix  (reservedOp "mod"  >> return (EBin Mod  )) AssocLeft]
+       , [ Infix  (reserved "mod"  >> return (EBin Mod  )) AssocLeft]
        ]
 
 eMinus = EBin Minus (expr (0 :: Integer)) 
@@ -283,6 +293,7 @@ exprCastP
        ((try dcolon) <|> colon)
        so <- sortP
        return $ ECst e so
+    <?> "cast"
 
 dcolon = string "::" <* spaces
 
@@ -292,6 +303,7 @@ sortP
   <|> try (string "int"     >>  return FInt)
   <|> try (FObj . symbol <$> lowerIdP)
   <|> (fApp <$> (Left <$> fTyConP) <*> many sortP)
+  <?> "type"
 
 symCharsP   = condIdP symChars (`notElem` keyWordSyms)
 
@@ -316,14 +328,16 @@ pred0P =  trueP
 
 predP  :: Parser Pred
 predP  = buildExpressionParser lops pred0P
+      <?> "predicate"
 
 
-predsP = brackets $ sepBy predP semi
+predsP = brackets (sepBy predP semi)
+      <?> "predicates"
 
-qmP    = reserved "?" <|> reserved "Bexp"
+qmP    = reservedOp "?" <|> reserved "Bexp"
 
 lops = [ [Prefix (reservedOp "~"    >> return PNot)]
-       , [Prefix (reservedOp "not " >> return PNot)]
+       , [Prefix (reserved "not " >> return PNot)]
        , [Infix  (reservedOp "&&"   >> return (\x y -> PAnd [x,y])) AssocRight]
        , [Infix  (reservedOp "||"   >> return (\x y -> POr  [x,y])) AssocRight]
        , [Infix  (reservedOp "=>"   >> return PImp) AssocRight]
@@ -364,11 +378,12 @@ condIteP f bodyP
 
 condQmP f bodyP 
   = do p  <- predP 
-       reserved "?"
+       reservedOp "?"
        b1 <- bodyP 
        colon
        b2 <- bodyP 
        return $ f p b1 b2
+     <?> "ternary conditional"
 
 ----------------------------------------------------------------------------------
 ------------------------------------ BareTypes -----------------------------------
@@ -389,7 +404,7 @@ refBindP bp rp kindP
   = braces $ do
       vv  <- bp
       t   <- kindP
-      reserved "|"
+      reservedOp "|"
       ras <- rp <* spaces
       return $ t (Reft (vv, ras))
 
@@ -513,7 +528,7 @@ iQualP
 solution1P
   = do reserved "solution:" 
        k  <- symbolP 
-       reserved ":=" 
+       reservedOp ":=" 
        ps <- brackets $ sepBy predSolP semi
        return (k, simplify $ PAnd ps)
 
