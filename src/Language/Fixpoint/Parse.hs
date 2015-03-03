@@ -9,7 +9,7 @@ module Language.Fixpoint.Parse (
   , Parser
 
   -- * Lexer to add new tokens
-  , lexer 
+  , lexer, reservedNames
 
   -- * Some Important keyword and parsers
   , reserved, reservedOp
@@ -18,6 +18,8 @@ module Language.Fixpoint.Parse (
   , colon   , dcolon 
   , whiteSpace
   , blanks
+  , nest, blockOf, foldedLinesOf
+  , identifier, operator
 
   -- * Parsing basic entities
   , fTyConP     -- Type constructors
@@ -56,7 +58,12 @@ module Language.Fixpoint.Parse (
 
 import Control.Applicative ((<*>), (<$>), (<*))
 import Control.Monad
-import Text.Parsec
+import Control.Monad.Identity
+import Control.Monad.State
+import Text.Parsec hiding (spaces)
+import Text.Parsec.Prim
+import qualified Text.Parsec.IndentParsec as IP
+import Text.Parsec.IndentParsec.Prim hiding (nest)
 import Text.Parsec.Expr
 import Text.Parsec.Pos
 import Text.Parsec.Language
@@ -67,6 +74,7 @@ import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.List as L
 
 import Data.Char (isLower, toUpper)
 import Language.Fixpoint.Misc hiding (dcolon)
@@ -79,42 +87,48 @@ import Data.Maybe(maybe, fromJust)
 
 import Data.Monoid (mempty)
 
-type Parser = Parsec String Integer
+type Parser a = IP.IndentParsec String Integer a
 
 --------------------------------------------------------------------
 
-languageDef =
-  emptyDef { Token.commentStart    = "/* "
+reservedNames = [ "SAT"
+                , "UNSAT"
+                , "true"
+                , "false"
+                , "data"
+                , "Bexp"
+                , "forall"
+                , "exists"
+                , "assume"
+                , "measure"
+                , "module"
+                , "spec"
+                , "where"
+                , "import"
+                , "if", "then", "else"
+                , "class", "instance"
+                , "inline", "assert"
+                , "Local", "using", "type"
+                , "predicate", "expression"
+                , "embed", "qualif"
+                , "Decrease", "LAZYVAR"
+                , "Strict", "Lazy"
+                , "LIQUID", "variance", "invariant"
+                , "covariant", "contravariant", "bivariant"
+                ]
+
+languageDef :: Monad m => GenLanguageDef String u m
+languageDef = Token.LanguageDef
+           { Token.commentStart    = "/* "
            , Token.commentEnd      = " */"
            , Token.commentLine     = "--"
-           , Token.identLetter     = Token.identLetter emptyDef <|> oneOf "#.'"
-           , Token.reservedNames   = [ "SAT"
-                                     , "UNSAT"
-                                     , "true"
-                                     , "false"
-                                     , "mod"
-                                     , "data"
-                                     , "Bexp"
-                                     , "forall"
-                                     , "exists"
-                                     , "assume"
-                                     , "measure"
-                                     , "module"
-                                     , "spec"
-                                     , "where"
-                                     , "import"
-                                     , "if", "then", "else"
-                                     , "mod", "and", "or"
-                                     , "class", "instance"
-                                     , "inline", "assert"
-                                     , "Local", "using", "type"
-                                     , "predicate", "expression"
-                                     , "embed", "qualif"
-                                     , "Decrease", "LAZYVAR"
-                                     , "Strict", "Lazy"
-                                     , "LIQUID", "variance", "invariant"
-                                     , "covariant", "contravariant", "bivariant"
-                                     ]
+           , Token.nestedComments  = True
+           , Token.caseSensitive   = True
+           , Token.identStart      = letter <|> char '_'
+           , Token.identLetter     = alphaNum <|> oneOf "#'"
+           , Token.opStart         = oneOf ":!#$%&*+./<=>?@\\^|-~"
+           , Token.opLetter        = oneOf ":!#$%&*+./<=>?@\\^|-~"
+           , Token.reservedNames   = reservedNames
            , Token.reservedOpNames = [ "+", "-", "*", "/", "\\"
                                      , "<", ">", "<=", ">=", "=", "!=" , "/="
                                   --, "is"
@@ -131,25 +145,27 @@ languageDef =
            }
 
 lexer         = Token.makeTokenParser languageDef
-identifier    = Token.identifier    lexer
-reserved      = Token.reserved      lexer
-reservedOp    = Token.reservedOp    lexer
-parens        = Token.parens        lexer
-brackets      = Token.brackets      lexer
-angles        = Token.angles        lexer
-semi          = Token.semi          lexer
-colon         = Token.colon         lexer
-comma         = Token.comma         lexer
-whiteSpace    = Token.whiteSpace    lexer
-stringLiteral = Token.stringLiteral lexer
-braces        = Token.braces        lexer
-double        = Token.float         lexer
+
+identifier    = IP.identifier    lexer
+operator      = IP.operator      lexer
+reserved      = IP.reserved      lexer
+reservedOp    = IP.reservedOp    lexer
+parens        = IP.parens        lexer
+brackets      = IP.brackets      lexer
+angles        = IP.angles        lexer
+semi          = IP.semi          lexer
+colon         = IP.colon         lexer
+comma         = IP.comma         lexer
+whiteSpace    = IP.whiteSpace    lexer
+stringLiteral = IP.stringLiteral lexer
+braces        = IP.braces        lexer
+double        = IP.float         lexer
 -- integer       = Token.integer       lexer
 
 -- identifier = Token.identifier lexer
 
-
-blanks  = many (satisfy (`elem` [' ', '\t']))
+spaces  = whiteSpace
+blanks  = whiteSpace -- many (satisfy (`elem` [' ', '\t']))
 
 integer = posInteger 
   
@@ -161,6 +177,40 @@ posInteger = toI <$> (many1 digit <* spaces)
     toI :: String -> Integer 
     toI = read
 
+-- blockOf :: (Monad m, Show t, Stream s (IndentT HaskellLike m) t)
+--         => IndentParsecT s u m a
+--         -> IndentParsecT s u m a
+blockOf = nest IP.Block
+
+-- | run a given parser inside a line fold.
+-- foldedLinesOf :: (Monad m, Show t, Stream s (IndentT HaskellLike m) t)
+--               => IndentParsecT s u m a
+--               -> IndentParsecT s u m a
+foldedLinesOf = nest IP.LineFold
+
+-- nest :: (Indentation i, Show i, Monad m, Stream s (IndentT i m) t, Show t)
+--      => (SourcePos -> i) -- ^ indentor function.
+--      -> GenIndentParsecT i s u m body -- ^ The nested parser to run
+--      -> GenIndentParsecT i s u m body
+nest indentor p = do outerI <- lift get
+                     curPos <- getPosition
+                     let innerI = indentor curPos
+                         in if innerI `IP.nestableIn` outerI
+                            then nestP innerI outerI p
+                            else nestP IP.never  outerI p
+
+-- nestP :: (Indentation i, Show i, Monad m, Stream s (IndentT i m) t, Show t)
+--       => i -- ^ Inner indentation
+--       -> i -- ^ Outer indentation
+--       -> GenIndentParsecT i s u m body -- ^ body parser
+--       -> GenIndentParsecT i s u m body
+
+nestP i o p = do lift $ put i
+                 x <- p
+                 -- notFollowedBy (tokeniser anyToken)
+                 --               <?> "unterminated " ++ show i
+                 lift $ put o
+                 return x
 ----------------------------------------------------------------
 ------------------------- Expressions --------------------------
 ----------------------------------------------------------------
@@ -171,10 +221,11 @@ locParserP p = liftM2 Loc getPosition p
 -- FIXME: we (LH) rely on this parser being dumb and *not* consuming trailing
 -- whitespace, in order to avoid some parsers spanning multiple lines..
 condIdP  :: [Char] -> (String -> Bool) -> Parser Symbol
-condIdP chars f 
-  = do c  <- letter
+condIdP chars f = try . IP.tokeniser $
+    do c  <- letter
        cs <- many (satisfy (`elem` chars))
        blanks
+       guard (c:cs `notElem` reservedNames)
        if f (c:cs) then return (symbol $ T.pack $ c:cs) else parserZero
 
 upperIdP :: Parser Symbol
@@ -187,7 +238,7 @@ locLowerIdP = locParserP lowerIdP
 locUpperIdP = locParserP upperIdP
 
 symbolP :: Parser Symbol
-symbolP = symbol <$> identifier
+symbolP = symbol <$> symCharsP
 
 constantP :: Parser Constant
 constantP = try (liftM R double) <|> liftM I integer <?> "number"
@@ -203,12 +254,8 @@ expr0P
  <|> (reservedOp "_|_" >> return EBot)
  <|> try (parens  exprP)
  <|> try (parens  exprCastP)
- <|> (charsExpr <$> identifier)
+ <|> try (expr <$> symbolP)
 
-charsExpr cs
-  | isLower (head cs)  = expr $ symbol cs
-  | otherwise          = EVar $ symbol cs
---  <|> try (parens $ condP EIte exprP)
 
 fastIfP f bodyP 
   = do reserved "if" 
@@ -227,12 +274,11 @@ expr1P
 
 exprP :: Parser Expr 
 exprP = buildExpressionParser bops expr1P
-     <?> "expression"
 
-funAppP            =  (try litP) <|> (try exprFunSpacesP) <|> (try exprFunSemisP) <|> exprFunCommasP
+funAppP            =  try litP <|> try exprFunSpacesP <|> try exprFunSemisP <|> try exprFunCommasP
                   <?> "function application"
   where 
-    exprFunSpacesP = liftM2 EApp funSymbolP (sepBy1 expr0P spaces) 
+    exprFunSpacesP = liftM2 EApp funSymbolP (sepBy1 expr0P whiteSpace)
     exprFunCommasP = liftM2 EApp funSymbolP (parens        $ sepBy exprP comma)
     exprFunSemisP  = liftM2 EApp funSymbolP (parenBrackets $ sepBy exprP semi)
     funSymbolP     = locParserP symbolP
@@ -305,9 +351,7 @@ sortP
   <|> (fApp <$> (Left <$> fTyConP) <*> many sortP)
   <?> "type"
 
-symCharsP   = condIdP symChars (`notElem` keyWordSyms)
-
-keyWordSyms = ["if", "then", "else", "mod"]
+symCharsP   = condIdP symChars 
 
 ---------------------------------------------------------------------
 -------------------------- Predicates -------------------------------
@@ -328,7 +372,6 @@ pred0P =  trueP
 
 predP  :: Parser Pred
 predP  = buildExpressionParser lops pred0P
-      <?> "predicate"
 
 
 predsP = brackets (sepBy predP semi)
@@ -337,7 +380,7 @@ predsP = brackets (sepBy predP semi)
 qmP    = reservedOp "?" <|> reserved "Bexp"
 
 lops = [ [Prefix (reservedOp "~"    >> return PNot)]
-       , [Prefix (reserved "not " >> return PNot)]
+       , [Prefix (reserved   "not"  >> return PNot)]
        , [Infix  (reservedOp "&&"   >> return (\x y -> PAnd [x,y])) AssocRight]
        , [Infix  (reservedOp "||"   >> return (\x y -> POr  [x,y])) AssocRight]
        , [Infix  (reservedOp "=>"   >> return PImp) AssocRight]
@@ -548,7 +591,7 @@ remainderP p
        return (res, str, pos) 
 
 doParse' parser f s
-  = case runParser (remainderP (whiteSpace >> parser)) 0 f s of
+  = case runIdentity (IP.runGIPT (remainderP (whiteSpace >> parser)) 0 f s) of
       Left e            -> die $ err (errorSpan e) $ printf "parseError %s\n when parsing from %s\n" (show e) f 
       Right (r, "", _)  -> r
       Right (_, rem, l) -> die $ err (SS l l) $ printf "doParse has leftover when parsing: %s\nfrom file %s\n" rem f

@@ -171,6 +171,7 @@ Library
                , filemanip
                , filepath
                , ghc-prim
+               , indentparser
                , intern
                , mtl
                , parsec
